@@ -1,0 +1,963 @@
+
+#include <iostream>
+#include <string>
+#include <ctime>
+#include <sstream>
+#include <chrono>
+#include <thread>
+#include <cstdlib>
+#include <iomanip>
+#include <algorithm>
+#include <vector>
+#include <stack>
+
+using namespace std;
+
+// Color Codes as Global Variables
+const string RED = "\033[31m";
+const string GREEN = "\033[32m";
+const string YELLOW = "\033[33m";
+const string BLUE = "\033[34m";
+const string RESET = "\033[0m";
+
+// Constants
+const size_t MAX_CHILDREN = 100;
+const size_t MAX_FILES = 1000;
+const size_t RECYCLE_BIN_SIZE = 100;
+const size_t RECENT_FILE_LIMIT = 10;
+const size_t MAX_VERSIONS = 10;
+
+enum UserRole {
+    ADMIN,
+    EDITOR,
+    VIEWER
+};
+
+struct UserPermissions {
+    bool canRead;
+    bool canWrite;
+    bool canExecute;
+
+    UserPermissions(bool read, bool write, bool execute)
+        : canRead(read), canWrite(write), canExecute(execute) {}
+};
+
+struct UserNode {
+    string username;
+    string password;
+    string securityQuestion;
+    string securityAnswer;
+    time_t lastLogout;
+    UserRole role;
+    UserPermissions permissions;
+    UserNode* next;
+
+    UserNode(string u, string p, string q, string a, UserRole r)
+        : username(u), password(p), securityQuestion(q), securityAnswer(a), role(r),
+        permissions(getPermissionsForRole(r)), lastLogout(0), next(nullptr) {}
+
+    UserPermissions getPermissionsForRole(UserRole role) {
+        switch (role) {
+        case ADMIN:
+            return UserPermissions(true, true, true);
+        case EDITOR:
+            return UserPermissions(true, true, false);
+        case VIEWER:
+            return UserPermissions(true, false, false);
+        default:
+            return UserPermissions(false, false, false);
+        }
+    }
+};
+
+struct FileContent {
+    string content;
+    time_t modifiedDate;
+
+    FileContent(string c = "") : content(c), modifiedDate(time(0)) {}
+};
+
+struct FileMetadata {
+    string name;
+    string type;
+    int size;
+    string owner;
+    time_t createdDate;
+    string hash;
+    string path;
+    FileContent versions[MAX_VERSIONS];
+    int versionCount;
+
+    FileMetadata() : size(0), createdDate(time(0)), versionCount(0) {}
+};
+
+struct FileNode {
+    string name;
+    bool isFolder;
+    FileNode* children[MAX_CHILDREN];
+    size_t childCount;
+    FileNode* parent;
+    FileMetadata* metadata; // Pointer to file metadata (nullptr for folders)
+
+    FileNode(string n, bool f, FileNode* p = nullptr, FileMetadata* m = nullptr)
+        : name(n), isFolder(f), childCount(0), parent(p), metadata(m) {
+        for (size_t i = 0; i < MAX_CHILDREN; i++) {
+            children[i] = nullptr;
+        }
+    }
+
+    ~FileNode() {
+        if (!isFolder && metadata != nullptr) {
+            delete metadata;
+        }
+    }
+};
+
+struct AVLNode {
+    FileMetadata* data;
+    AVLNode* left;
+    AVLNode* right;
+    int height;
+
+    AVLNode(FileMetadata* data) : data(data), left(nullptr), right(nullptr), height(1) {}
+};
+
+class AVLTree {
+private:
+    AVLNode* root;
+
+    int height(AVLNode* node) {
+        if (node == nullptr) return 0;
+        return node->height;
+    }
+
+    int getBalance(AVLNode* node) {
+        if (node == nullptr) return 0;
+        return height(node->left) - height(node->right);
+    }
+
+    AVLNode* rightRotate(AVLNode* y) {
+        AVLNode* x = y->left;
+        AVLNode* T2 = x->right;
+
+        x->right = y;
+        y->left = T2;
+
+        y->height = max(height(y->left), height(y->right)) + 1;
+        x->height = max(height(x->left), height(x->right)) + 1;
+
+        return x;
+    }
+
+    AVLNode* leftRotate(AVLNode* x) {
+        AVLNode* y = x->right;
+        AVLNode* T2 = y->left;
+
+        y->left = x;
+        x->right = T2;
+
+        x->height = max(height(x->left), height(x->right)) + 1;
+        y->height = max(height(y->left), height(y->right)) + 1;
+
+        return y;
+    }
+
+    AVLNode* insert(AVLNode* node, FileMetadata* data) {
+        if (node == nullptr) return new AVLNode(data);
+
+        if (data->name < node->data->name) {
+            node->left = insert(node->left, data);
+        }
+        else if (data->name > node->data->name) {
+            node->right = insert(node->right, data);
+        }
+        else {
+            return node; // Duplicate keys not allowed
+        }
+
+        node->height = 1 + max(height(node->left), height(node->right));
+
+        int balance = getBalance(node);
+
+        // Left Left Case
+        if (balance > 1 && data->name < node->left->data->name) {
+            return rightRotate(node);
+        }
+
+        // Right Right Case
+        if (balance < -1 && data->name > node->right->data->name) {
+            return leftRotate(node);
+        }
+
+        // Left Right Case
+        if (balance > 1 && data->name > node->left->data->name) {
+            node->left = leftRotate(node->left);
+            return rightRotate(node);
+        }
+
+        // Right Left Case
+        if (balance < -1 && data->name < node->right->data->name) {
+            node->right = rightRotate(node->right);
+            return leftRotate(node);
+        }
+
+        return node;
+    }
+
+    AVLNode* minValueNode(AVLNode* node) {
+        AVLNode* current = node;
+        while (current->left != nullptr) {
+            current = current->left;
+        }
+        return current;
+    }
+
+    AVLNode* deleteNode(AVLNode* root, string name) {
+        if (root == nullptr) return root;
+
+        if (name < root->data->name) {
+            root->left = deleteNode(root->left, name);
+        }
+        else if (name > root->data->name) {
+            root->right = deleteNode(root->right, name);
+        }
+        else {
+            if ((root->left == nullptr) || (root->right == nullptr)) {
+                AVLNode* temp = root->left ? root->left : root->right;
+
+                if (temp == nullptr) {
+                    temp = root;
+                    root = nullptr;
+                }
+                else {
+                    *root = *temp;
+                }
+                delete temp;
+            }
+            else {
+                AVLNode* temp = minValueNode(root->right);
+                root->data = temp->data;
+                root->right = deleteNode(root->right, temp->data->name);
+            }
+        }
+
+        if (root == nullptr) return root;
+
+        root->height = 1 + max(height(root->left), height(root->right));
+
+        int balance = getBalance(root);
+
+        // Left Left Case
+        if (balance > 1 && getBalance(root->left) >= 0) {
+            return rightRotate(root);
+        }
+
+        // Left Right Case
+        if (balance > 1 && getBalance(root->left) < 0) {
+            root->left = leftRotate(root->left);
+            return rightRotate(root);
+        }
+
+        // Right Right Case
+        if (balance < -1 && getBalance(root->right) <= 0) {
+            return leftRotate(root);
+        }
+
+        // Right Left Case
+        if (balance < -1 && getBalance(root->right) > 0) {
+            root->right = rightRotate(root->right);
+            return leftRotate(root);
+        }
+
+        return root;
+    }
+
+    void preOrderTraversal(AVLNode* root) {
+        if (root != nullptr) {
+            cout << BLUE << "File: " << root->data->path << "\\" << root->data->name
+                << " (Type: " << root->data->type << ", Size: " << root->data->size << " bytes)" << RESET << endl;
+            preOrderTraversal(root->left);
+            preOrderTraversal(root->right);
+        }
+    }
+
+    AVLNode* search(AVLNode* root, string name) {
+        if (root == nullptr) return nullptr;
+
+        if (root->data->name == name) {
+            return root;
+        }
+
+        if (root->data->name < name) {
+            return search(root->right, name);
+        }
+
+        return search(root->left, name);
+    }
+
+public:
+    AVLTree() : root(nullptr) {}
+
+    void insert(FileMetadata* data) {
+        root = insert(root, data);
+    }
+
+    void deleteNode(string name) {
+        root = deleteNode(root, name);
+    }
+
+    void preOrderTraversal() {
+        preOrderTraversal(root);
+    }
+
+    FileMetadata* search(string name) {
+        AVLNode* result = search(root, name);
+        if (result) {
+            cout << YELLOW << "File found at path: " << result->data->path << RESET << endl;
+            return result->data;
+        }
+        else {
+            cout << YELLOW << "File not found: " << name << RESET << endl;
+            return nullptr;
+        }
+    }
+};
+
+class FileSystem {
+private:
+    FileNode* root;
+    FileNode* currentFolder;
+    AVLTree fileTree;
+    size_t fileCount;
+
+    stack<string> recycleBin; // Changed to stack for LIFO behavior
+    string recentFiles[RECENT_FILE_LIMIT];
+    size_t recentFront, recentRear, recentSize;
+
+    UserNode* usersHead;
+
+    string formatTime(time_t time) {
+        char buffer[80];
+        struct tm timeinfo;
+        localtime_s(&timeinfo, &time);
+        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+        return string(buffer);
+    }
+
+    string hashFileName(const string& fileName) {
+        unsigned long hash = 0;
+        int prime = 31;
+        for (char c : fileName) {
+            hash = hash * prime + c;
+        }
+        stringstream ss;
+        ss << hex << hash;
+        return ss.str();
+    }
+
+public:
+    FileSystem() {
+        root = new FileNode("This PC", true);
+        currentFolder = root;
+        fileCount = 0;
+        recentFront = 0;
+        recentRear = -1;
+        recentSize = 0;
+        usersHead = nullptr;
+    }
+
+    UserNode* findUser(string username) {
+        UserNode* curr = usersHead;
+        while (curr) {
+            if (curr->username == username) return curr;
+            curr = curr->next;
+        }
+        return nullptr;
+    }
+
+    string getCurrentPath() {
+        vector<string> pathComponents;
+        FileNode* node = currentFolder;
+
+        while (node != nullptr) {
+            pathComponents.push_back(node->name);
+            node = node->parent;
+        }
+
+        reverse(pathComponents.begin(), pathComponents.end());
+
+        string path;
+        for (size_t i = 0; i < pathComponents.size(); i++) {
+            if (i != 0) path += "\\";
+            path += pathComponents[i];
+        }
+
+        return path;
+    }
+
+    // User management functions
+    bool signup(string username, string password, string question, string answer, UserRole role) {
+        if (findUser(username) != nullptr) {
+            cout << GREEN << "Username already exists." << RESET << endl;
+            return false;
+        }
+        UserNode* newUser = new UserNode(username, password, question, answer, role);
+        newUser->next = usersHead;
+        usersHead = newUser;
+        cout << RED << "User signed up successfully." << RESET << endl;
+        return true;
+    }
+
+    bool login(string username, string password) {
+        UserNode* user = findUser(username);
+        if (!user) {
+            cout << BLUE << "Username not found." << RESET << endl;
+            return false;
+        }
+        if (user->password == password) {
+            cout << BLUE << "Login successful." << RESET << endl;
+            return true;
+        }
+        else {
+            int choice;
+            cout << RED << "Incorrect password. Recover password?\n1. Yes\n2. No\nEnter choice: " << RESET << endl;
+            cin >> choice;
+            cin.ignore();
+            if (choice == 1) {
+                cout << RED << "Security Question: " << user->securityQuestion << RESET << endl;
+                string answer;
+                cout << RED << "Enter answer: " << RESET << endl;
+                getline(cin, answer);
+                if (answer == user->securityAnswer) {
+                    cout << RED << "Answer correct. Enter new password: " << RESET << endl;
+                    string newPassword;
+                    getline(cin, newPassword);
+                    user->password = newPassword;
+                    cout << RED << "Password updated successfully!" << RESET << endl;
+                    return true;
+                }
+                else {
+                    cout << RED << "Incorrect answer. Cannot recover password." << RESET << endl;
+                    return false;
+                }
+            }
+            cout << BLUE << "Login failed." << RESET << endl;
+            return false;
+        }
+    }
+
+    void logout(string username) {
+        UserNode* user = findUser(username);
+        if (user) {
+            user->lastLogout = time(0);
+            cout << BLUE << "Logout time saved for " << username << RESET << endl;
+        }
+        else {
+            cout << BLUE << "User not found." << RESET << endl;
+        }
+    }
+
+    void createFolder(string folderName) {
+        if (currentFolder->childCount < MAX_CHILDREN) {
+            currentFolder->children[currentFolder->childCount++] = new FileNode(folderName, true, currentFolder);
+            cout << BLUE << "Folder created: " << folderName << RESET << endl;
+        }
+        else {
+            cout << "Folder limit reached in current directory." << endl;
+        }
+    }
+
+    FileNode* searchFolder(FileNode* node, const string& folderName) {
+        if (node->isFolder && node->name == folderName) {
+            return node;
+        }
+        for (size_t i = 0; i < node->childCount; ++i) {
+            FileNode* found = searchFolder(node->children[i], folderName);
+            if (found) return found;
+        }
+        return nullptr;
+    }
+
+    void createFile(string fileName, FileMetadata metadata, string folderName) {
+        currentFolder = searchFolder(root, folderName);  // assuming 'root' is the top-level directory
+        if (!currentFolder) {
+            cout << RED << "Folder '" << folderName << "' not found." << RESET << endl;
+            return;
+        }
+        if (currentFolder->childCount < MAX_CHILDREN && fileCount < MAX_FILES) {
+            FileMetadata* fileMeta = new FileMetadata(metadata);
+            fileMeta->name = fileName;
+            fileMeta->hash = hashFileName(fileName);
+            fileMeta->path = getCurrentPath();
+            fileMeta->createdDate = time(0);
+
+            // Initialize first version
+            fileMeta->versions[0] = FileContent();
+            fileMeta->versionCount = 1;
+
+            FileNode* newFile = new FileNode(fileName, false, currentFolder, fileMeta);
+            currentFolder->children[currentFolder->childCount++] = newFile;
+            fileTree.insert(fileMeta);
+            fileCount++;
+            cout << "File created: " << fileName << " (Hash: " << fileMeta->hash
+                << ", Created: " << formatTime(fileMeta->createdDate) << ")" << endl;
+        }
+        else {
+            cout << "File limit reached in current directory or system file limit reached." << endl;
+        }
+    }
+
+    void readFile(string fileName, UserNode* user) {
+        if (!canUserAccessFile(user, "read")) {
+            cout << RED << "Permission denied: Read access required." << RESET << endl;
+            return;
+        }
+
+        FileMetadata* meta = fileTree.search(fileName);
+        if (meta && meta->versionCount > 0) {
+            cout << GREEN << "File content: " << RESET << endl;
+            cout << meta->versions[meta->versionCount - 1].content << endl;
+            cout << GREEN << "Last modified: "
+                << formatTime(meta->versions[meta->versionCount - 1].modifiedDate) << RESET << endl;
+        }
+        else {
+            cout << RED << "File not found or has no content." << RESET << endl;
+        }
+    }
+
+    void updateFile(string fileName, string newContent, UserNode* user) {
+        if (!canUserAccessFile(user, "write")) {
+            cout << RED << "Permission denied: Write access required." << RESET << endl;
+            return;
+        }
+
+        FileMetadata* meta = fileTree.search(fileName);
+        if (meta) {
+            if (meta->versionCount < MAX_VERSIONS) {
+                meta->versions[meta->versionCount++] = FileContent(newContent);
+            }
+            else {
+                // Shift versions to make room (remove oldest)
+                for (size_t j = 0; j < MAX_VERSIONS - 1; j++) {
+                    meta->versions[j] = meta->versions[j + 1];
+                }
+                meta->versions[MAX_VERSIONS - 1] = FileContent(newContent);
+            }
+            meta->size = newContent.size();
+            cout << GREEN << "File updated successfully. Version "
+                << meta->versionCount << " created." << RESET << endl;
+        }
+        else {
+            cout << RED << "File not found." << RESET << endl;
+        }
+    }
+
+    void changeDirectory(string folderName) {
+        if (folderName == "..") {
+            if (currentFolder->parent) {
+                currentFolder = currentFolder->parent;
+                cout << BLUE << "Moved to parent folder: " << currentFolder->name << RESET << endl;
+            }
+            else {
+                cout << BLUE << "Already at root directory." << RESET << endl;
+            }
+            return;
+        }
+
+        for (size_t i = 0; i < currentFolder->childCount; i++) {
+            if (currentFolder->children[i]->isFolder && currentFolder->children[i]->name == folderName) {
+                currentFolder = currentFolder->children[i];
+                cout << BLUE << "Changed to folder: " << folderName << RESET << endl;
+                return;
+            }
+        }
+        cout << GREEN << "Folder not found: " << folderName << RESET << endl;
+    }
+
+    void showFileVersions(string fileName) {
+        FileMetadata* meta = fileTree.search(fileName);
+        if (meta && meta->versionCount > 0) {
+            cout << YELLOW << "Versions for " << fileName << ":" << RESET << endl;
+            for (size_t v = 0; v < meta->versionCount; v++) {
+                cout << "Version " << v + 1 << " ("
+                    << formatTime(meta->versions[v].modifiedDate) << "):" << endl;
+                cout << meta->versions[v].content << endl;
+            }
+        }
+        else {
+            cout << RED << "File not found or has no versions." << RESET << endl;
+        }
+    }
+
+    void deleteFile(string fileName, UserNode* user) {
+        if (!canUserAccessFile(user, "write")) {
+            cout << RED << "Permission denied: Write access required." << RESET << endl;
+            return;
+        }
+
+        FileMetadata* meta = fileTree.search(fileName);
+        if (meta) {
+            if (recycleBin.size() < RECYCLE_BIN_SIZE) {
+                // Store file path in recycle bin
+                string filePath = meta->path + "\\" + fileName;
+                recycleBin.push(filePath);
+
+                // Remove from file tree
+                fileTree.deleteNode(fileName);
+
+                // Remove from folder
+                FileNode* folder = searchFolder(root, meta->path);
+                if (folder) {
+                    for (size_t i = 0; i < folder->childCount; i++) {
+                        if (!folder->children[i]->isFolder &&
+                            folder->children[i]->name == fileName) {
+                            delete folder->children[i];
+                            for (size_t j = i; j < folder->childCount - 1; j++) {
+                                folder->children[j] = folder->children[j + 1];
+                            }
+                            folder->childCount--;
+                            fileCount--;
+                            break;
+                        }
+                    }
+                }
+
+                cout << GREEN << "File moved to recycle bin: " << fileName << RESET << endl;
+            }
+            else {
+                cout << RED << "Recycle bin is full!" << RESET << endl;
+            }
+        }
+        else {
+            cout << RED << "File not found: " << fileName << RESET << endl;
+        }
+    }
+
+    void restoreFile() {
+        if (!recycleBin.empty()) {
+            string filePath = recycleBin.top();
+            recycleBin.pop();
+
+            // Parse file path and name
+            size_t lastSlash = filePath.find_last_of('\\');
+            string fileName = filePath.substr(lastSlash + 1);
+            string folderPath = filePath.substr(0, lastSlash);
+
+            // Create a new file node and add it back to the current folder
+            FileMetadata* fileMeta = new FileMetadata();
+            fileMeta->name = fileName;
+            fileMeta->path = folderPath;
+            fileMeta->createdDate = time(0);
+
+            FileNode* restoredFile = new FileNode(fileName, false, currentFolder, fileMeta);
+            currentFolder->children[currentFolder->childCount++] = restoredFile;
+            fileTree.insert(fileMeta);
+            fileCount++;
+
+            cout << GREEN << "File restored from recycle bin: " << fileName << RESET << endl;
+        }
+        else {
+            cout << RED << "Recycle bin is empty!" << RESET << endl;
+        }
+    }
+
+    void searchFile(string fileName) {
+        FileMetadata* meta = fileTree.search(fileName);
+        if (meta) {
+            cout << GREEN << "File found: " << meta->path << "\\" << meta->name << RESET << endl;
+            cout << GREEN << "Type: " << meta->type << ", Size: " << meta->size << " bytes" << endl;
+            cout << GREEN << "Created: " << formatTime(meta->createdDate) << endl;
+            cout << GREEN << "Versions: " << meta->versionCount << endl;
+        }
+    }
+
+    void shareFile(string fromUser, string toUser, string fileName) {
+        UserNode* from = findUser(fromUser);
+        UserNode* to = findUser(toUser);
+        if (from && to) {
+            cout << YELLOW << "File '" << fileName << "' shared from " << fromUser << " to " << toUser << RESET << endl;
+        }
+        else {
+            cout << BLUE << "One or both users not found." << RESET << endl;
+        }
+    }
+
+    void displayCurrentDirectory() {
+        cout << BLUE << "Current directory: " << getCurrentPath() << RESET << endl;
+        cout << BLUE << "Contents:" << RESET << endl;
+
+        // Display folders first
+        for (size_t i = 0; i < currentFolder->childCount; i++) {
+            if (currentFolder->children[i]->isFolder) {
+                cout << "[Folder] " << currentFolder->children[i]->name << endl;
+            }
+        }
+
+        // Then display files with metadata
+        for (size_t i = 0; i < currentFolder->childCount; i++) {
+            if (!currentFolder->children[i]->isFolder) {
+                FileMetadata* meta = currentFolder->children[i]->metadata;
+                if (meta) {
+                    cout << "[File] " << currentFolder->children[i]->name
+                        << " (Size: " << meta->size << " bytes, "
+                        << "Created: " << formatTime(meta->createdDate) << ")" << endl;
+                }
+                else {
+                    cout << "[File] " << currentFolder->children[i]->name << endl;
+                }
+            }
+        }
+    }
+
+    void displayFiles() {
+        cout << GREEN << "Files in the system:" << endl;
+        fileTree.preOrderTraversal();
+    }
+
+    bool canUserAccessFile(UserNode* user, string permissionType) {
+        if (!user) return false;
+
+        if (permissionType == "read") {
+            return user->permissions.canRead;
+        }
+        else if (permissionType == "write") {
+            return user->permissions.canWrite;
+        }
+        else if (permissionType == "execute") {
+            return user->permissions.canExecute;
+        }
+
+        return false;
+    }
+
+    void modifyUserRole(UserNode* user, UserRole newRole) {
+        if (user) {
+            user->role = newRole;
+            user->permissions = user->getPermissionsForRole(newRole);
+            cout << "User role updated to: " << newRole << endl;
+        }
+    }
+
+    string runLengthEncode(string str) {
+        string result;
+        int count = 1;
+        for (size_t i = 1; i < str.size(); i++) {
+            if (str[i] == str[i - 1]) {
+                count++;
+            }
+            else {
+                result += str[i - 1] + to_string(count);
+                count = 1;
+            }
+        }
+        result += str.back() + to_string(count);
+        return result;
+    }
+
+    string runLengthDecode(string str) {
+        string result;
+        for (size_t i = 0; i < str.size(); i += 2) {
+            char ch = str[i];
+            int count = str[i + 1] - '0';
+            result.append(count, ch);
+        }
+        return result;
+    }
+};
+
+int main() {
+    cout << YELLOW << "\t\t\t\t======================DATA PROJECT BY=======================" << RESET << endl;
+    cout << GREEN << "\t\t\t\t|                                                           |" << RESET << endl;
+    cout << GREEN << "\t\t\t\t|                         WARISHA                           |" << RESET << endl;
+    cout << GREEN << "\t\t\t\t|                         SEEMA                             |" << RESET << endl;
+    cout << GREEN << "\t\t\t\t|                         NAWAL                             |" << RESET << endl;
+    cout << YELLOW << "\t\t\t\t============================================================" << RESET << endl;
+
+    this_thread::sleep_for(chrono::seconds(10));
+    system("CLS");
+
+    FileSystem fs;
+    int choice;
+    string username, password, question, answer, folderName, fileName, from, to, content, fName;
+    FileMetadata fileMeta;
+    UserNode* currentUser = nullptr;
+
+    while (true) {
+        cout << GREEN << "\n\t\t\t\t\t==== File System Menu ====\n" << RESET << endl;
+        cout << YELLOW << "\t\t\t\t\t1. Signup\n\t\t\t\t\t2. Login\n\t\t\t\t\t3. Create Folder\n\t\t\t\t\t4. Create File\n" << RESET;
+        cout << YELLOW << "\t\t\t\t\t5. Read File\n\t\t\t\t\t6. Update File\n\t\t\t\t\t7. Show File Versions\n" << RESET;
+        cout << YELLOW << "\t\t\t\t\t8. Delete File\n\t\t\t\t\t9. Restore File\n\t\t\t\t\t10. Change Directory\n" << RESET;
+        cout << YELLOW << "\t\t\t\t\t11. Display Current Directory\n\t\t\t\t\t12. Search File\n" << RESET;
+        cout << YELLOW << "\t\t\t\t\t13. Share File\n\t\t\t\t\t14. Run-Length Encode\n\t\t\t\t\t15. Run-Length Decode\n" << RESET;
+        cout << YELLOW << "\t\t\t\t\t16. Logout\n\t\t\t\t\t17. Display Files\n\t\t\t\t\t18. Modify User Role\n\t\t\t\t\t0. Exit\n\t\t\t\t\tChoice: " << RESET;
+        cin >> choice;
+        cin.ignore();
+
+        if (choice == 0) break;
+
+        switch (choice) {
+        case 1:
+        {
+            string username, password, question, answer;
+            int roleChoice;
+            UserRole role;
+
+            cout << RED << "Username: "; getline(cin, username);
+            cout << "Password: "; getline(cin, password);
+            cout << "Security Question: "; getline(cin, question);
+            cout << "Answer: "; getline(cin, answer);
+            cout << "Role (0: Admin, 1: Editor, 2: Viewer): ";
+            cin >> roleChoice;
+            cin.ignore();
+
+            switch (roleChoice) {
+            case 0:
+                role = ADMIN;
+                break;
+            case 1:
+                role = EDITOR;
+                break;
+            case 2:
+                role = VIEWER;
+                break;
+            default:
+                cout << "Invalid role choice." << endl;
+                continue;
+            }
+
+            fs.signup(username, password, question, answer, role);
+            break;
+        }
+        case 2:
+            cout << GREEN << "Username: "; getline(cin, username);
+            cout << "Password: "; getline(cin, password);
+            if (fs.login(username, password)) {
+                currentUser = fs.findUser(username);
+                // Set owner for files created by this user
+                fileMeta.owner = username;
+            }
+            break;
+        case 3:
+            if (currentUser) {
+                cout << YELLOW << "Folder Name: "; getline(cin, folderName);
+                fs.createFolder(folderName);
+            }
+            else {
+                cout << "You're not logged in. Please try later!" << endl;
+            }
+            break;
+        case 4:
+            if (currentUser) {
+                cout << RED << "Folder name: "; getline(cin, fName);
+                cout << "File Name: "; getline(cin, fileName);
+                cout << "File Type: "; getline(cin, fileMeta.type);
+                cout << "Initial Content: "; getline(cin, content);
+                fileMeta.size = content.size();
+                fs.createFile(fileName, fileMeta, fName);
+                fs.updateFile(fileName, content, currentUser); // Set initial content
+            }
+            else {
+                cout << "You're not logged in. Please try later!" << endl;
+            }
+            break;
+        case 5:
+            cout << GREEN << "File Name: "; getline(cin, fileName);
+            fs.readFile(fileName, currentUser);
+            break;
+        case 6:
+            cout << YELLOW << "File Name: "; getline(cin, fileName);
+            cout << "New Content: "; getline(cin, content);
+            fs.updateFile(fileName, content, currentUser);
+            break;
+        case 7:
+            cout << RED << "File Name: "; getline(cin, fileName);
+            fs.showFileVersions(fileName);
+            break;
+        case 8:
+            cout << GREEN << "File Name to Delete: "; getline(cin, fileName);
+            fs.deleteFile(fileName, currentUser);
+            break;
+        case 9:
+            fs.restoreFile();
+            break;
+        case 10:
+            cout << YELLOW << "Folder Name (or '..' for parent): "; getline(cin, folderName);
+            fs.changeDirectory(folderName);
+            break;
+        case 11:
+            fs.displayCurrentDirectory();
+            break;
+        case 12:
+            cout << RED << "File Name to Search: "; getline(cin, fileName);
+            fs.searchFile(fileName);
+            break;
+        case 13:
+            cout << GREEN << "From User: "; getline(cin, from);
+            cout << "To User: "; getline(cin, to);
+            cout << "File Name: "; getline(cin, fileName);
+            fs.shareFile(from, to, fileName);
+            break;
+        case 14:
+            cout << YELLOW << "Enter string to encode: ";
+            getline(cin, fileName);
+            cout << "Encoded: " << fs.runLengthEncode(fileName) << endl;
+            break;
+        case 15:
+            cout << RED << "Enter string to decode: ";
+            getline(cin, fileName);
+            cout << "Decoded: " << fs.runLengthDecode(fileName) << endl;
+            break;
+        case 16:
+            cout << GREEN << "Username: "; getline(cin, username);
+            fs.logout(username);
+            currentUser = nullptr;
+            break;
+        case 17:
+            fs.displayFiles();
+            break;
+        case 18:
+            if (currentUser) {
+                cout << GREEN << "Username: "; getline(cin, username);
+                UserNode* user = fs.findUser(username);
+                if (user) {
+                    cout << "New Role (0: Admin, 1: Editor, 2: Viewer): ";
+                    int newRoleChoice;
+                    cin >> newRoleChoice;
+                    cin.ignore();
+                    UserRole newRole;
+                    switch (newRoleChoice) {
+                    case 0:
+                        newRole = ADMIN;
+                        break;
+                    case 1:
+                        newRole = EDITOR;
+                        break;
+                    case 2:
+                        newRole = VIEWER;
+                        break;
+                    default:
+                        cout << "Invalid role choice." << endl;
+                        continue;
+                    }
+                    fs.modifyUserRole(user, newRole);
+                }
+                else {
+                    cout << "User not found." << endl;
+                }
+            }
+            else {
+                cout << "You're not logged in. Please try later!" << endl;
+            }
+            break;
+        default:
+            cout << RED << "Invalid choice." << endl;
+        }
+    }
+
+    cout << GREEN << "Exiting program." << endl;
+    cout << RED << "Exiting program." << endl;
+    cout << BLUE << "Exiting program." << endl;
+    cout << YELLOW << "Exiting program." << endl;
+    system("pause");
+    return 0;
+}
